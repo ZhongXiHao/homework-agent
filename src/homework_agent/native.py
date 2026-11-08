@@ -3,6 +3,7 @@ import os
 from homework_agent import tools
 from dotenv import load_dotenv
 from openai import OpenAI
+from dataclasses import dataclass, field
 
 TOOLS = [
     # ---------- list_assignments ----------
@@ -43,31 +44,44 @@ client = OpenAI(api_key=os.getenv("LLM_API_KEY"), base_url=os.getenv("LLM_BASE_U
 MODEL = os.getenv("LLM_MODEL_ID")
 
 
-def run(question: str, max_steps: int = 8) -> tuple[str | None, int, int]:
-    tokens = 0
+@dataclass(slots=True)
+class RunResult:
+    answer: str | None
+    tokens: int = 0
+    steps: int = 0
+    tool_calls: list[str] = field(default_factory=list)  # 按顺序记录调用过的工具名
+
+
+def run(question: str, max_steps: int = 8, verbose: bool = True) -> RunResult:
+    output = RunResult(answer=None)
     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question}]
     for step in range(max_steps):
         resp = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS, reasoning_effort="low")
         msg = resp.choices[0].message
-        print(
-            f"Step {step + 1}: Tokens used: {resp.usage.total_tokens}, Finish reason: {resp.choices[0].finish_reason}")
-        tokens = tokens + resp.usage.total_tokens
+        if verbose:
+            print(
+                f"Step {step + 1}: Tokens used: {resp.usage.total_tokens}, Finish reason: {resp.choices[0].finish_reason}")
+        output.tokens = output.tokens + resp.usage.total_tokens
 
         assistant = {"role": "assistant", "content": msg.content or ""}
 
         if assistant["content"]:
-            print(f"Step {step + 1}: Assistant said:\n{assistant['content']}... end\n")
+            if verbose:
+                print(f"Step {step + 1}: Assistant said:\n{assistant['content']}... end\n")
 
         if msg.tool_calls:
             assistant["tool_calls"] = [c.model_dump() for c in msg.tool_calls]
-            print(f"Step {step + 1}: Assistant called tools:\n{assistant['tool_calls']}... end\n")
+            if verbose:
+                print(f"Step {step + 1}: Assistant called tools:\n{assistant['tool_calls']}... end\n")
 
         messages.append(assistant)
 
         if not msg.tool_calls:  # 没有工具调用 = 最终回答
-            return msg.content, tokens, step + 1
+            output.answer = msg.content
+            output.steps = step + 1
+            return output
 
         for call in msg.tool_calls:  # 一次响应里可能有多个工具调用
             try:
@@ -75,10 +89,14 @@ def run(question: str, max_steps: int = 8) -> tuple[str | None, int, int]:
                 result = fn(**json.loads(call.function.arguments))
             except Exception as e:
                 result = {"error": f"{type(e).__name__}: {e}"}
-            print(f"Step {step + 1}: Tool {call.function.name} returned:\n{result}... end\n")
+            if verbose:
+                print(f"Step {step + 1}: Tool {call.function.name} returned:\n{result}... end\n")
+            output.tool_calls.append(call.function.name)
             messages.append({"role": "tool", "tool_call_id": call.id,
                              "content": json.dumps(result, ensure_ascii=False)})
-    return "超过最大步数，未能完成", tokens, step + 1
+    output.answer = "超过最大步数，未能完成"
+    output.steps = max_steps
+    return output
 
 
 def main() -> None:
@@ -86,10 +104,8 @@ def main() -> None:
     import sys
 
     if len(sys.argv) > 1:
-        answer, tokens, steps = run(" ".join(sys.argv[1:]))
-        print(answer)
-        print(f"Tokens used: {tokens}\n")
-        print(f"Steps: {steps}\n")
+        r = run(" ".join(sys.argv[1:]))
+        print_result(r)
         return
 
     print("作业助手已启动，输入 exit 或按 Ctrl+D 退出。")
@@ -102,10 +118,13 @@ def main() -> None:
         if question in ("exit", "quit"):
             break
         if question:
-            answer, tokens, steps = run(question)
-            print(answer)
-            print(f"Tokens used: {tokens}\n")
-            print(f"Steps: {steps}\n")
+            r = run(question)
+            print_result(r)
+
+
+def print_result(r: RunResult) -> None:
+    print(f"Final answer: {r.answer}")
+    print(f"Tokens used: {r.tokens}, Steps: {r.steps}, Tools: {r.tool_calls}\n")
 
 
 if __name__ == '__main__':
