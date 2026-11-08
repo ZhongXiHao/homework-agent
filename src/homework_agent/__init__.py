@@ -1,2 +1,3 @@
-def main() -> None:
-    print("Hello from homework-agent!")
+from homework_agent import tools
+
+__all__ = ["tools"]
