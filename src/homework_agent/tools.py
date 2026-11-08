@@ -7,7 +7,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 load_dotenv()
-ASSIGNMENT_DIR = Path(os.environ.get("ASSIGNMENT_DIR", r"~/projects/agent/homework-agent/data")).expanduser()
+# 相对路径按项目根目录解析，而不是按运行时所在的目录，这样从任何目录启动都能找到数据
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_assignment_dir = Path(os.environ.get("ASSIGNMENT_DIR", "data")).expanduser()
+ASSIGNMENT_DIR = _assignment_dir if _assignment_dir.is_absolute() else PROJECT_ROOT / _assignment_dir
 DEFAULT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
