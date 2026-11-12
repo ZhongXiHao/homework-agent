@@ -110,27 +110,28 @@ graph = graph_builder.compile()
 def run(question: str, max_steps: int = 8, verbose: bool = True) -> RunResult:
     output = RunResult(answer=None)
     try:
-        result = graph.invoke(
-            {"messages": [HumanMessage(question)]},
-            config={"recursion_limit": 2 * max_steps},
-        )
+        for chunk in graph.stream(
+                input={"messages": [HumanMessage(content=question)]},
+                config={"recursion_limit": 2 * max_steps},
+                stream_mode="updates"):
+            for node, update in chunk.items():
+                if not update:
+                    continue
+                for msg in update["messages"]:
+                    if verbose:
+                        print(f"── {node} ──")
+                        msg.pretty_print()
+                    if isinstance(msg, AIMessage):
+                        output.steps += 1
+                        output.tool_calls += [c["name"] for c in msg.tool_calls]
+                        output.answer = msg.content
+                        if msg.usage_metadata:
+                            output.tokens += msg.usage_metadata["total_tokens"]
     except GraphRecursionError:
-        output.answer = f"超过最大步数 {max_steps}，未得到最终回答"
-        return output
-
-    for msg in result["messages"]:
-        if isinstance(msg, AIMessage):
-            output.steps += 1
-            output.tool_calls += [c["name"] for c in msg.tool_calls]
-            if msg.usage_metadata:
-                output.tokens += msg.usage_metadata["total_tokens"]
-
-    output.answer = result["messages"][-1].content
+        output.answer = "超过最大步数，未能完成"
     return output
 
 
 if __name__ == "__main__":
-    result = graph.invoke({"messages": [HumanMessage(content="软件工程有哪些作业")]})
+    run("软件工程有哪些作业？")
     print(graph.get_graph().draw_mermaid())
-    for m in result["messages"]:
-        m.pretty_print()
