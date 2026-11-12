@@ -19,13 +19,13 @@ def load_json(p, default):
 
 
 # 未提交作业列表：ID、课程、标题、截止时间
-def list_assignments(course: str | None = None):
+def list_assignments(course: str | None = None) -> list[dict]:
     assignments = load_json(ASSIGNMENT_DIR / "assignments.json", [])
     return [a for a in assignments if course is None or a["course"] == course]
 
 
 # 作业说明、要求、附件名
-def get_assignment(assignment_id: str):
+def get_assignment(assignment_id: str) -> dict | None:
     if assignment_id is None:
         raise ValueError("assignment_id is None")
     assignments = load_json(ASSIGNMENT_DIR / "assignments.json", [])
@@ -33,7 +33,7 @@ def get_assignment(assignment_id: str):
 
 
 # 距离截止还有几天几小时
-def days_until(deadline: str):
+def days_until(deadline: str | None) -> str:
     if deadline is None:
         return "无截止时间"
     try:
