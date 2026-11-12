@@ -11,6 +11,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.constants import START, END
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import add_messages, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 
 # 加载环境变量
 load_dotenv()
@@ -97,13 +98,21 @@ def should_continue(state: State) -> str:
     return END
 
 
+USE_PREBUILT = True
+
 graph_builder = StateGraph(State)
 graph_builder.add_node("agent", chat)
-graph_builder.add_node("tools", use_tool)
+
+if USE_PREBUILT:
+    graph_builder.add_node("tools", ToolNode(TOOLS, handle_tool_errors=True))
+    graph_builder.add_conditional_edges("agent", tools_condition)
+else:
+    graph_builder.add_node("tools", use_tool)
+    graph_builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
 
 graph_builder.add_edge(START, "agent")
 graph_builder.add_edge("tools", "agent")
-graph_builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+
 graph = graph_builder.compile()
 
 
