@@ -51,6 +51,10 @@ def empty_dir(tmp_path, monkeypatch):
 
 
 # ---------- list_assignments ----------
+def test_list_returns_summary_only(data_dir):
+    for a in tools.list_assignments():
+        assert set(a) == {"id", "course", "name", "due_at"}
+
 
 def test_list_all_when_no_course(data_dir):
     assert [a["id"] for a in tools.list_assignments()] == ["a1", "a2", "a3"]
@@ -109,12 +113,12 @@ def frozen_now(monkeypatch):
 @pytest.mark.parametrize(
     "deadline, expected",
     [
-        ("2026-11-12T03:30:00Z", "2天3小时"),           # 超过一天
-        ("2026-11-10T05:20:00Z", "5小时20分钟"),        # 不到一天
-        ("2026-11-10T00:45:00Z", "45分钟"),             # 不到一小时
-        ("2026-11-09T23:00:00Z", "已过期"),             # 已过截止时间
-        ("2026-11-12T11:30:00+08:00", "2天3小时"),      # 与第一条是同一时刻
-        ("2026-11-10T13:00:00", "5小时0分钟"),          # 不带时区，按北京时间处理
+        ("2026-11-12T03:30:00Z", "2天3小时"),  # 超过一天
+        ("2026-11-10T05:20:00Z", "5小时20分钟"),  # 不到一天
+        ("2026-11-10T00:45:00Z", "45分钟"),  # 不到一小时
+        ("2026-11-09T23:00:00Z", "已过期"),  # 已过截止时间
+        ("2026-11-12T11:30:00+08:00", "2天3小时"),  # 与第一条是同一时刻
+        ("2026-11-10T13:00:00", "5小时0分钟"),  # 不带时区，按北京时间处理
     ],
 )
 def test_days_until(frozen_now, deadline, expected):

@@ -11,7 +11,7 @@ TOOLS = [
     # ---------- list_assignments ----------
     {"type": "function", "function": {
         "name": "list_assignments",
-        "description": "列出未提交的作业，可按课程过滤 返回 list[dict]: 作业列表，每个作业是一个字典，包含 id, 课程名称, 作业标题, 截止时间, 描述, 附件名称",
+        "description": "列出未提交作业的摘要（id、课程、标题、截止时间），可按课程过滤。要看作业要求和附件，再用 get_assignment 查询。",
         "parameters": {"type": "object",
                        "properties": {
                            "course": {"anyOf": [{"type": "string"}, {"type": "null"}],
@@ -19,7 +19,7 @@ TOOLS = [
     # --------- get_assignment ----------
     {"type": "function", "function": {
         "name": "get_assignment",
-        "description": "按作业 ID 获取作业说明、要求、附件名 返回一个字典，包含作业的详细信息，包括 id, 课程名称, 作业标题, 截止时间, 描述, 附件名称；或 None，如果找不到该作业",
+        "description": "按作业 ID 获取作业完整信息，包括说明、要求和附件名；找不到时返回 None。",
         "parameters": {"type": "object",
                        "properties": {
                            "assignment_id": {"type": "string", "description": "作业 id"}},

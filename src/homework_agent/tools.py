@@ -18,10 +18,20 @@ def load_json(p, default):
     return json.loads(p.read_text(encoding="utf-8")) if p.exists() else default
 
 
-# 未提交作业列表：ID、课程、标题、截止时间
+# 未提交作业列表：只返回 ID、课程、标题、截止时间
 def list_assignments(course: str | None = None) -> list[dict]:
     assignments = load_json(ASSIGNMENT_DIR / "assignments.json", [])
-    return [a for a in assignments if course is None or a["course"] == course]
+    if course:
+        assignments = [a for a in assignments if a["course"] == course]
+    return [
+        {
+            "id": a["id"],
+            "course": a["course"],
+            "name": a["name"],
+            "due_at": a["due_at"],
+        }
+        for a in assignments
+    ]
 
 
 # 作业说明、要求、附件名
