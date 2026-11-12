@@ -1,19 +1,16 @@
+import os
 from typing import Annotated, TypedDict
 
+from dotenv import load_dotenv
 from homework_agent import tools
+from homework_agent.prompts import SYSTEM_PROMPT
+from homework_agent.run_result import RunResult
 from langchain_core.messages import (BaseMessage, SystemMessage, AIMessage, HumanMessage, ToolMessage)
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-import os
-from dotenv import load_dotenv
 from langgraph.constants import START, END
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import add_messages, StateGraph
-
-SYSTEM_PROMPT = """
-你是一个作业助手，帮助学生查询作业信息。
-你可以根据用户的提问，选择调用合适的工具，并将结果返回给用户。请注意，所有的时间都是以北京时间为准。
-**作业信息只能来自工具的返回结果，不要编造。工具出错或没有数据时，如实告诉用户。**
-"""
 
 # 加载环境变量
 load_dotenv()
@@ -112,6 +109,29 @@ graph_builder.add_edge(START, "agent")
 graph_builder.add_edge("tools", "agent")
 graph_builder.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
 graph = graph_builder.compile()
+
+
+def run(question: str, max_steps: int = 8, verbose: bool = True) -> RunResult:
+    output = RunResult(answer=None)
+    try:
+        result = graph.invoke(
+            {"messages": [HumanMessage(question)]},
+            config={"recursion_limit": 2 * max_steps},
+        )
+    except GraphRecursionError:
+        output.answer = f"超过最大步数 {max_steps}，未得到最终回答"
+        return output
+
+    for msg in result["messages"]:
+        if isinstance(msg, AIMessage):
+            output.steps += 1
+            output.tool_calls += [c["name"] for c in msg.tool_calls]
+            if msg.usage_metadata:
+                output.tokens += msg.usage_metadata["total_tokens"]
+
+    output.answer = result["messages"][-1].content
+    return output
+
 
 if __name__ == "__main__":
     result = graph.invoke({"messages": [HumanMessage(content="软件工程有哪些作业")]})

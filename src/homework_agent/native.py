@@ -3,53 +3,45 @@ import os
 from homework_agent import tools
 from dotenv import load_dotenv
 from openai import OpenAI
-from dataclasses import dataclass, field
+from homework_agent.prompts import SYSTEM_PROMPT
+from homework_agent.run_result import RunResult
 
+# 与 graph.py 中 @tool 生成的 schema 逐字一致，保证两个版本发给模型的内容相同、评测可比
 TOOLS = [
     # ---------- list_assignments ----------
     {"type": "function", "function": {
         "name": "list_assignments",
-        "description": "列出未提交的作业，可按课程过滤",
+        "description": "列出未提交的作业，可按课程过滤 返回 list[dict]: 作业列表，每个作业是一个字典，包含 id, 课程名称, 作业标题, 截止时间, 描述, 附件名称",
         "parameters": {"type": "object",
-                       "properties": {"course": {"type": "string", "description": "课程名，可省略"}}}}},
+                       "properties": {
+                           "course": {"anyOf": [{"type": "string"}, {"type": "null"}],
+                                      "default": None, "description": "课程名，可省略"}}}}},
     # --------- get_assignment ----------
     {"type": "function", "function": {
         "name": "get_assignment",
-        "description": "按作业 ID 获取作业说明、要求、附件名",
+        "description": "按作业 ID 获取作业说明、要求、附件名 返回一个字典，包含作业的详细信息，包括 id, 课程名称, 作业标题, 截止时间, 描述, 附件名称；或 None，如果找不到该作业",
         "parameters": {"type": "object",
                        "properties": {
-                           "assignment_id": {"type": "string", "description": "作业 ID"}},
+                           "assignment_id": {"type": "string", "description": "作业 id"}},
                        "required": ["assignment_id"]}}},
     # --------- days_until ----------
     {"type": "function", "function": {
         "name": "days_until",
-        "description": "按 ISO 格式的截止时间计算当前距离截止还有几天几小时，不足一天则显示几小时几分钟，不足一小时则显示几分钟，已过期则返回“已过期”，无截止时间则返回“无截止时间”",
+        "description": "按 ISO 格式的截止时间计算当前距离截止的剩余时间 返回\"X天Y小时\"；不足一天返回\"X小时Y分钟\"；已过期返回\"已过期\"；无截止时间返回\"无截止时间\"。",
         "parameters": {"type": "object",
                        "properties": {
-                           "deadline": {"type": "string", "description": "截止时间，ISO 格式"}},
+                           "deadline": {"anyOf": [{"type": "string"}, {"type": "null"}],
+                                        "description": "ISO 格式的截止时间字符串"}},
                        "required": ["deadline"]}}},
 ]
 FUNCS = {"list_assignments": tools.list_assignments,
          "get_assignment": tools.get_assignment,
          "days_until": tools.days_until}
 
-SYSTEM_PROMPT = """
-你是一个作业助手，帮助学生查询作业信息。
-你可以根据用户的提问，选择调用合适的工具，并将结果返回给用户。请注意，所有的时间都是以北京时间为准。
-"""
-
 load_dotenv()
 
 client = OpenAI(api_key=os.getenv("LLM_API_KEY"), base_url=os.getenv("LLM_BASE_URL"))
 MODEL = os.getenv("LLM_MODEL_ID")
-
-
-@dataclass(slots=True)
-class RunResult:
-    answer: str | None
-    tokens: int = 0
-    steps: int = 0
-    tool_calls: list[str] = field(default_factory=list)  # 按顺序记录调用过的工具名
 
 
 def run(question: str, max_steps: int = 8, verbose: bool = True) -> RunResult:

@@ -1,8 +1,12 @@
 import subprocess
 import sys
 from pathlib import Path
+import importlib
 
-from homework_agent.native import run
+impl = sys.argv[1] if len(sys.argv) > 1 else "graph"
+run = importlib.import_module(f"homework_agent.{impl}").run
+
+print(f"Using implementation: {impl}")
 
 # 每次评测前重新生成模拟数据，保证截止时间相对于“今天”是固定的
 GEN_DATA = Path(__file__).resolve().parent / "gen_data.py"
