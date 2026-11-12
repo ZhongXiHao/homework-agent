@@ -259,3 +259,58 @@ invoke(input)
 | `messages.append(...)` | 第 3 步：`add_messages` reducer |
 | `if not msg.tool_calls: return output` | 第 5 步：条件边 `should_continue` 返回 `END` |
 | 调用模型、执行工具 | 第 2 步：节点，这是我们唯一需要写的部分 |
+## 9. 预制组件：`ToolNode` 和 `tools_condition`
+
+```python
+from langgraph.prebuilt import ToolNode, tools_condition
+
+graph_builder.add_node("tools", ToolNode(TOOLS, handle_tool_errors=True))  # 替代手写的 use_tool
+graph_builder.add_conditional_edges("agent", tools_condition)               # 替代手写的 should_continue
+```
+
+- `tools_condition` 的返回类型是 `Literal["tools", "__end__"]`，所以**工具节点必须命名为 `"tools"`**。`"__end__"` 就是 `END` 常量的值。
+- `ToolNode` **不能脱离图单独 `.invoke`**，会报 `Missing required config key 'N/A' for 'tools'`。它依赖图运行时注入的 config。要单独测试，就搭一个 `START → tools → END` 的小图。
+
+### 坑：默认的错误处理只处理参数校验错误
+
+同样 4 种情况，和手写的 `use_tool` 对比：
+
+| 情况 | 手写 `use_tool` | `ToolNode` 默认 | `handle_tool_errors=True` |
+| --- | --- | --- | --- |
+| 正常调用 | success | success | success |
+| 工具名不存在 | error | error（会列出可用工具） | error |
+| 漏传参数（`ValidationError`） | error | error | error |
+| **工具内部抛异常**（`days_until("明天")`） | error | **抛出异常，整张图崩溃** | error |
+
+原因（`langgraph/prebuilt/tool_node.py`）：
+
+```python
+def _default_handle_tool_errors(e: Exception) -> str:
+    if isinstance(e, ToolInvocationError):   # 只处理参数校验错误
+        return e.message
+    raise e                                  # 其他异常全部抛出
+```
+
+只写 `ToolNode(TOOLS)` 的话，"工具出错时不让图崩溃"这个保证会**悄悄失效**。正常流程的 eval 也发现不了，因为 eval 不会触发工具内部异常。
+
+`handle_tool_errors` 还可以传字符串（固定的错误提示）、函数（自定义错误格式），或者异常类型/元组（只处理这几种异常）。
+
+### 用测试锁住这个配置
+
+`tests/test_graph.py` 从编译好的图里取出**真正注册的节点**来测，而不是在测试里重新创建一个 `ToolNode`：
+
+```python
+graph.graph.builder.nodes["tools"].runnable   # graph.py 里实际配置的 ToolNode
+```
+
+验证过：把 `handle_tool_errors=True` 删掉后，`test_tool_error_becomes_error_message[configured-days_until-...]` 会失败。
+
+### 比手写版多做的事
+
+- **并行执行多个工具调用**：`executor.map(self._run_one, tool_calls, ...)` 用了线程池；手写版的 for 循环是串行执行的。
+- **错误信息带引导**：会列出可用的工具名，结尾加上 "Please fix your mistakes."，引导模型修正后重试。
+- **扩展点**：`wrap_tool_call` 可以在工具调用前后插入逻辑（日志、重试、权限检查），相当于 hook。Step 5 可能用得上。
+
+### 对比结果
+
+切换到预制组件后，eval 仍然是 3/3，token 和步数与手写版基本一致（1940 vs 1974、1895 vs 1889）。Step 3 的 `create_agent` 内部应该也是用 `ToolNode` 执行工具（目前还没装 `langchain`，到时候读源码确认），届时同样要检查错误处理的默认行为。
