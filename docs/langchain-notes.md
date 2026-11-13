@@ -313,4 +313,80 @@ graph.graph.builder.nodes["tools"].runnable   # graph.py 里实际配置的 Tool
 
 ### 对比结果
 
-切换到预制组件后，eval 仍然是 3/3，token 和步数与手写版基本一致（1940 vs 1974、1895 vs 1889）。Step 3 的 `create_agent` 内部应该也是用 `ToolNode` 执行工具（目前还没装 `langchain`，到时候读源码确认），届时同样要检查错误处理的默认行为。
+切换到预制组件后，eval 仍然是 3/3，token 和步数与手写版基本一致（1940 vs 1974、1895 vs 1889）。Step 3 的 `create_agent` 内部也用 `ToolNode`，而且**用的是默认错误处理**，见第 10 节。
+
+## 10. `create_agent`：模型参数和错误处理
+
+> 基于 `langchain 1.5.0`。
+
+### `model` 传字符串：靠模型名前缀猜厂商
+
+`create_agent(model="gpt-4o")` 内部调用 `init_chat_model`，根据模型名前缀推断厂商（`langchain/chat_models/base.py` 的 `_attempt_infer_model_provider`）：
+
+```python
+if model_lower.startswith(("gpt-", "o1", "o3", "chatgpt", ...)):  return "openai"
+if model_lower.startswith("claude"):                              return "anthropic"
+if model_lower.startswith("gemini"):                              return "google_vertexai"
+...
+```
+
+`glm-5.3-flash` 不匹配任何前缀，所以报错：`ValueError: Unable to infer model provider for model='glm-5.3-flash'`。网上教程用 `gpt-` 或 `claude-` 开头的模型名，所以能正常运行。
+
+| 写法 | 结果 |
+| --- | --- |
+| `model="glm-5.3-flash"` | ❌ 推断不出厂商 |
+| `model="openai:glm-5.3-flash"` | 能推断出厂商（"按 OpenAI 协议调用"），但只能从 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 读取配置，读不到我们 `.env` 里的 `LLM_*` 变量，会请求 OpenAI 官方地址 |
+| `init_chat_model("openai:" + 模型名, api_key=..., base_url=...)` | ✅ 返回的就是 `ChatOpenAI` |
+| `model=ChatOpenAI(...)` 实例 | ✅ **采用这种**：跳过推断，配置最明确 |
+
+`model` 参数既可以接收字符串，也可以接收 `BaseChatModel` 实例。字符串写法只在换厂商时少改几行，代价是多一层隐式推断。用 OpenAI 兼容接口、需要自定义 `base_url` 时，直接创建 `ChatOpenAI` 最清楚。
+
+### 坑：工具内部抛异常会让 agent 崩溃
+
+`create_agent` 内部创建 `ToolNode` 时**没有传 `handle_tool_errors`**（`langchain/agents/factory.py`）：
+
+```python
+tool_node = ToolNode(
+    tools=available_tools,
+    wrap_tool_call=wrap_tool_call_wrapper,
+    awrap_tool_call=awrap_tool_call_wrapper,
+)
+```
+
+所以第 9 节那个坑在这里同样存在。用一个固定返回 `days_until("明天")` 的假模型验证（不花 token）：`CRASH ValueError: deadline 不是 ISO 格式: 明天`。
+
+`create_agent` 不能直接传 `ToolNode` 参数，修法是用 **middleware**：
+
+```python
+from langchain.agents.middleware import wrap_tool_call
+from langchain_core.messages import ToolMessage
+
+@wrap_tool_call
+def tool_errors_to_message(request, handler):
+    try:
+        return handler(request)              # 执行原本的工具调用
+    except Exception as e:
+        return ToolMessage(content=f"{type(e).__name__}: {e}",
+                           tool_call_id=request.tool_call["id"], status="error")
+
+agent = create_agent(model=llm, tools=TOOLS, system_prompt=SYSTEM_PROMPT,
+                     middleware=[tool_errors_to_message])
+```
+
+修好后的消息序列：`Human → AI(tool_calls) → Tool(status=error, "ValueError: ...") → AI("done")`。
+
+`wrap_tool_call` 就是第 9 节提到的 hook 扩展点：`handler(request)` 相当于"继续执行"，在它前后可以加日志、重试、权限检查。写法和 Java Servlet 的 `Filter` 里调用 `chain.doFilter(...)`、Spring AOP 的 `@Around` 里调用 `proceed()` 是一样的。
+
+### 用假模型测试 agent
+
+```python
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+class Fake(GenericFakeChatModel):
+    def bind_tools(self, tools, **kw):       # create_agent 会调用 bind_tools，假模型默认不支持
+        return self
+
+m = Fake(messages=iter([AIMessage("", tool_calls=[bad_call]), AIMessage("done")]))
+```
+
+假模型按顺序返回预设的消息，可以精确构造"模型调错了工具"这类场景。测试跑得快，结果确定，也不花 token。
