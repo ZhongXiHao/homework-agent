@@ -259,6 +259,46 @@ invoke(input)
 | `messages.append(...)` | 第 3 步：`add_messages` reducer |
 | `if not msg.tool_calls: return output` | 第 5 步：条件边 `should_continue` 返回 `END` |
 | 调用模型、执行工具 | 第 2 步：节点，这是我们唯一需要写的部分 |
+
+### `invoke` = 把 `stream` 跑完
+
+`invoke` 本身不执行图，内部就是把 `stream` 消费完，只返回最后的结果（`langgraph/pregel/main.py`，没有 `@overload` 的那个 `def invoke`，默认的 v1 分支）。简化后：
+
+```python
+def invoke(self, input, config, stream_mode="values", ...):
+    latest = None
+    interrupts = []
+    for mode, payload in self.stream(input, config,
+                                     stream_mode=["updates", "values"], ...):
+        if mode == "updates" and INTERRUPT in payload:   # INTERRUPT == "__interrupt__"
+            interrupts.extend(payload[INTERRUPT])       # 1. 从 updates 里收集中断
+        elif mode == "values":
+            latest = payload                            # 2. 每步覆盖，最后剩下的就是最终 state
+
+    if interrupts:
+        return {**latest, "__interrupt__": interrupts}  # 3. 把中断合并进返回的 dict
+    return latest
+```
+
+- **`invoke` 和 `stream` 是同一个执行引擎。** 用 Java 类比，`stream` 是 `Stream<Chunk>`，`invoke` 相当于对它做 `reduce((a, b) -> b)`。graph 版 `run()` 从 `invoke` 改成 `stream`，执行逻辑完全不变，只是多了中途观察的机会。上面的 super-step 流程图对两者都适用。
+- **`result["__interrupt__"]` 不是 state 里的字段**（`State` 里只有 `messages`），是 `invoke` 返回前额外合并进 dict 的。直接用 `stream` 拿不到这个 key，要自己从 chunk 里取。
+- **`stream(stream_mode="updates")` 遇到中断时，会产出一个单独的 chunk**：`{"__interrupt__": (Interrupt(value={...}),)}`。它的"节点名"是 `__interrupt__`，值是 tuple 而不是 `{"messages": [...]}`。像 graph 版 `run()` 那样直接写 `update["messages"]`，开了 HITL 就会报 `TypeError`，要先判断 `if node == "__interrupt__":`。
+- **`invoke(..., version="v2")`** 返回 `GraphOutput(value=..., interrupts=...)`，中断放在单独的字段里，不和 state 混在一起。v1 的写法有个隐患：如果 state 里本身就有 `__interrupt__` 字段，会被覆盖。
+
+### 流式输出的两种粒度
+
+| | 每次产出 | 用途 |
+| --- | --- | --- |
+| `stream(stream_mode="updates")` | 节点执行完后返回的**完整消息** | 日志、统计 steps / tokens、eval（`run()` 用的就是这个） |
+| `stream(stream_mode="values")` | 每步结束后的**完整 state** | 需要看全量 state 时 |
+| `stream_events(version="v3")` 的 `.messages` | 模型输出的**每个 token** | 给用户看的打字机效果 |
+
+`stream_events` 的 `version` 指的是**事件格式**的版本，不是 LangChain 的版本：
+
+- v1 / v2 只支持异步（`astream_events`），同步调用会报 `NotImplementedError`。返回的是事件 dict，例如 `{"event": "on_chat_model_stream", ...}`。
+- v3 支持同步，返回 `GraphRunStream`，提供按类型划分的视图（`.messages`、`.values`、`.output`、`.interrupts`）。但它是**实验性 API**，每次调用都会打出 `LangChainBetaWarning: The v3 streaming protocol on Pregel is experimental.`。这条警告继承自 `DeprecationWarning`，只是提示，不影响运行。可以用 `warnings.filterwarnings("ignore", category=LangChainBetaWarning)` 关掉，但不建议在项目代码里全局关闭。要用 v3，就封装在一个函数里，以后它变了只改一处。
+
+看教程时，凡是涉及 `version=` 这类参数的，先去 `.venv` 里核对一下自己所装版本的源码或 docstring。
 ## 9. 预制组件：`ToolNode` 和 `tools_condition`
 
 ```python
