@@ -553,3 +553,108 @@ MCP 生成的 schema 还会多出 `title` 字段（如 `"title": "Course"`），
 ### 结果
 
 MCP 版 eval 3/3：1943 / 1933 / 498 tok，和其他三个版本在同一水平。每道题都会重新执行 `get_tools()`，也就会重新启动一次 MCP server 子进程，所以每题会多花一两秒。
+
+## 12. 持久化记忆和人工确认
+
+### checkpointer：读取是自动的
+
+只要 config 里带上 `thread_id`，每次 `astream` 都会自动执行三步：
+
+```
+astream({"messages": [新问题]}, config={"configurable": {"thread_id": X}})
+  ├─ 1. checkpointer.aget_tuple(config)   ← 从数据库读出 X 的最新 checkpoint
+  ├─ 2. add_messages 把 [新问题] 追加到历史 messages 后面
+  └─ 3. 照常跑图，每个 super-step 结束后写一个新的 checkpoint
+```
+
+所以只需要传**新的那一条**消息，不用自己拼历史，也不用写读数据库的代码。程序重启后想接着聊，只要拿到同一个 thread_id 就行。thread_id 记在哪里由业务决定：CLI 阶段打印出来，下次当参数传回去；以后放到前端的 URL 里，或者存进 `conversations(thread_id, user_id, title, created_at)` 业务表。checkpointer 只存 Agent 的运行状态，不管"某个用户有哪些会话"这种业务元数据。
+
+只有给前端展示历史时才需要主动读，用 `await agent.aget_state(config)` 就行，不用写 SQL。
+
+**同步和异步不能混用**：`AsyncPostgresSaver` 配 `AsyncConnectionPool`，只能和 `astream` / `ainvoke` 一起用；同步的 `stream` 要用 `PostgresSaver` 配 `ConnectionPool`。连接池的三个参数是硬性要求：`autocommit=True`、`row_factory=dict_row`、`prepare_threshold=0`。
+
+### checkpoint 不是加密的
+
+在数据库里看到的 `\x9ac7d5...` 不是密文，而是 **msgpack 序列化**的结果。数据存在 `bytea` 列里，客户端把它显示成十六进制，所以看着像密文。不需要密钥就能还原：
+
+```python
+JsonPlusSerializer().loads_typed((row["type"], bytes(row["blob"])))   # 直接得到 HumanMessage / AIMessage 列表
+```
+
+真要加密，用 `EncryptedSerializer.from_pycryptodome_aes()`，密钥放在 `LANGGRAPH_AES_KEY` 里。密钥一旦丢失，历史会话就全都读不出来了。
+
+### 超时：捕获 LangChain 统一的异常
+
+`langchain_openai` 抛出的异常同时继承了两套体系：
+
+```
+OpenAITimeoutError
+ ├─ openai.APITimeoutError → APIConnectionError → APIError        （厂商 SDK）
+ └─ langchain_core.exceptions.ModelTimeoutError → ModelError       （LangChain 统一）
+```
+
+捕获 `langchain_core.exceptions` 里的那套，换模型厂商时 `except` 不用改。顺序是子类在前、父类在后，跟 Java 一样。`ModelAuthenticationError` 不要吞掉，它说明配置写错了。
+
+- `ChatOpenAI(timeout=60, max_retries=2)` 管的是**单次 HTTP 请求**，重试由 SDK 内部完成。
+- `async with asyncio.timeout(180)` 管的是**整轮对话**，工具卡死也算在内。超时会抛出内置的 `TimeoutError`。
+- 不设超时，eval 就卡过两次，一次十几分钟。
+
+### 人工确认（HITL）：中断交给调用方处理
+
+`HumanInTheLoopMiddleware(interrupt_on={"add_to_calendar": True})` 会让图在执行这个工具之前**暂停**。此时 `astream` 的最后一个 chunk 是：
+
+```python
+{"__interrupt__": (Interrupt(value={"action_requests": [...], "review_configs": [...]}),)}
+```
+
+`_arun` 只负责把这个中断记到 `RunResult.interrupt` 里，不在内部调用 `input()`，因为 agent 层不该知道人在哪里。CLI 里由 `chat()` 问终端，eval 按用例里的 `approve` 自动作答，以后换成 FastAPI，就是 `POST /chat` 返回中断信息，前端点确认后再调用 `POST /chat/{thread_id}/resume`。恢复时传给 `astream` 的不是新消息，而是 `Command(resume={"decisions": [...]})`，所以 `_arun` 的第一个参数要能接收"任意输入"，不能在内部写死 `HumanMessage(question)`。
+
+#### 坑 1：`Command` 导错包
+
+```python
+from langgraph_sdk.schema import Command   # ❌ 远程 LangGraph Server 客户端用的 TypedDict
+from langgraph.types import Command        # ✅
+```
+
+`langgraph_sdk` 里的 `Command(resume=...)` 只是一个普通的 dict：`{"resume": {...}}`。传给 `astream` 后，它会被当成一次新的普通输入，于是：
+
+1. 中断没有被恢复，图从头再跑一遍，模型再次调用 `add_to_calendar`，再次触发中断……
+2. 工具一次都没有真正执行，历史里留下一串**只有 tool_call、没有 ToolMessage** 的 AIMessage。
+3. 模型最后编出一句"已经写入成功"，但 `calendar.json` 是空的。
+
+两个 `Command` 都能导入，也都能运行，不会报错，是 IDE 自动补全选错了。第 3 点和 Step 2 里 `use_tool` 忘了 return 是同一个现象：**模型看不到工具结果时，就会自己补出一个结果**，system prompt 里写"不要编造"也拦不住。
+
+#### 坑 2：没处理完的中断会污染会话
+
+如果中断之后程序退出了，下次又在同一个 thread 里直接提新问题，历史里就会留下悬空的调用。所以 `chat()` 启动时要先检查：
+
+```python
+state = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+if state.interrupts:                  # 上次停在确认环节，先让用户确认
+    pending = state.interrupts[0].value
+```
+
+这和审批流一样：用户重新打开页面时，先展示"待审批"的单子。
+
+#### 坑 3：恢复后同一条 AIMessage 会被输出两次
+
+恢复执行时，HITL 的 `after_model` 节点（节点名是 `HumanInTheLoopMiddleware.after_model`）会返回 `{"messages": [last_ai_msg, *拒绝产生的 ToolMessage]}`。这条 AIMessage 的 id 没变，`add_messages` 会替换它，State 里不会重复，但 `stream_mode="updates"` 会把它再输出一次。统计 token、步数和工具调用时，只统计 `node == "model"` 的消息，否则 `add_to_calendar` 会被算两次。
+
+#### 其他要点
+
+- decision 的数量必须和 `action_requests` 的数量一致。
+- 拒绝时的 `message` 会以 ToolMessage 的形式交给模型，要写清楚"没有执行"，模型才能如实告诉用户。
+- 恢复时用 `while r.interrupt` 循环，因为恢复后模型可能再次调用写入工具。
+- 中断依赖 checkpointer，暂停时的状态就存在 checkpointer 里，没有 checkpointer 就无法暂停和恢复。
+
+### eval：写操作要检查副作用
+
+- 中文措辞太多变，"已帮您把…添加到"跟"已帮你添加"差了两处。写操作的主要判据是**调没调用写入工具**，以及**数据有没有真的写进去**；回答措辞只放宽成词根（"添加 / 加入 / 加到"），作为辅助检查。
+- `expect_calendar`：每道题开始前清空 `calendar.json`，跑完后检查里面的作业 ID 集合。拒绝题期望是空集合，正好验收"拒绝后不会写入"。
+- 遇到中断时按用例的 `approve` 作答，**不写时默认拒绝**，意料之外的写入一律不放行。
+- 工具设计：`add_to_calendar(assignment_id)` 只接收 ID，截止时间由工具自己去查，不让模型填日期，原则和 `days_until` 一样。出错一律 raise，由 middleware 统一转成 `status="error"` 的 ToolMessage；按 ID 去重，保证幂等。
+- 多轮用例用 `turns: [...]`，共用一个 thread_id，只检查最后一轮。eval 用 `InMemorySaver`，不依赖数据库里的旧数据，就像单测里用 H2 代替真实数据库。
+
+### 结果
+
+agent 版 eval 16/16，总共 32350 token，耗时 266 秒。多轮追问的第二轮只调用了 `get_assignment`，没有再调 `list_assignments`，说明模型是从历史里拿到作业 ID 的。多轮题的 token 比单轮题多出几百到一千多，因为历史消息会全部带上。
