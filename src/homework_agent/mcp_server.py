@@ -31,5 +31,11 @@ def days_until(
     return tools.days_until(deadline)
 
 
+@mcp.tool()
+def add_to_calendar(assignment_id: Annotated[str, Field(description="作业 ID，来自 list_assignments")]) -> str:
+    """将作业添加到日历中，返回添加结果。"""
+    return tools.add_to_calendar(assignment_id)
+
+
 if __name__ == "__main__":
-    mcp.run()          # 默认走 stdio
+    mcp.run()  # 默认走 stdio

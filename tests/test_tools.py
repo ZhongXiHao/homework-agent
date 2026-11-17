@@ -132,3 +132,36 @@ def test_days_until_none(frozen_now):
 def test_days_until_invalid_format(frozen_now):
     with pytest.raises(ValueError, match="不是 ISO 格式"):
         tools.days_until("明天")
+
+
+# ---- add_to_calendar ----
+
+def _calendar(dir_):
+    return json.loads((dir_ / "calendar.json").read_text(encoding="utf-8"))
+
+
+def test_add_to_calendar_writes_event(data_dir):
+    msg = tools.add_to_calendar("a1")
+    assert "已将" in msg
+    assert _calendar(data_dir) == [
+        {"assignment_id": "a1", "title": "软件工程 - 需求规格说明书", "due_at": "2026-11-12T15:59:00Z"}
+    ]
+
+
+def test_add_to_calendar_is_idempotent(data_dir):
+    tools.add_to_calendar("a1")
+    msg = tools.add_to_calendar("a1")
+    assert "已在日历中" in msg
+    assert len(_calendar(data_dir)) == 1
+
+
+def test_add_to_calendar_unknown_id_raises(data_dir):
+    with pytest.raises(ValueError, match="找不到作业 x9"):
+        tools.add_to_calendar("x9")
+    assert not (data_dir / "calendar.json").exists()
+
+
+def test_add_to_calendar_no_due_date_raises(data_dir):
+    with pytest.raises(ValueError, match="没有截止时间"):
+        tools.add_to_calendar("a3")
+    assert not (data_dir / "calendar.json").exists()

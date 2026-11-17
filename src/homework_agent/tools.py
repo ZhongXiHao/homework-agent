@@ -69,8 +69,30 @@ def days_until(deadline: str | None) -> str:
     return f"{minutes}分钟"
 
 
+# 把作业的截止时间加入日历（目前写本地 JSON 模拟，Step 6 换成真实日历 API）
+# 出错一律 raise，由 ToolNode / middleware 统一转成 status="error" 的 ToolMessage
+def add_to_calendar(assignment_id: str) -> str:
+    assignment = get_assignment(assignment_id)
+    if assignment is None:
+        raise ValueError(f"找不到作业 {assignment_id}，请先用 list_assignments 查询正确的 ID")
+    if assignment["due_at"] is None:
+        raise ValueError(f"「{assignment['name']}」没有截止时间，无法加入日历")
+
+    title = f"{assignment['course']} - {assignment['name']}"
+    path = ASSIGNMENT_DIR / "calendar.json"
+    events = load_json(path, [])
+    if any(e["assignment_id"] == assignment_id for e in events):  # 按 ID 去重：重复调用结果不变（幂等）
+        return f"「{title}」已在日历中，无需重复添加"
+
+    # 日历条目只保留日历需要的字段，结构接近 Google Calendar 的 event
+    events.append({"assignment_id": assignment_id, "title": title, "due_at": assignment["due_at"]})
+    path.write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
+    return f"已将「{title}」加入日历，截止时间 {assignment['due_at']}"
+
+
 if __name__ == "__main__":
     print(list_assignments("软件工程"))
     print(get_assignment("a3"))
     print(days_until("2026-11-09T04:00:00Z"))
     print(days_until("2026-11-12T15:59:00+08:00"))
+    print(add_to_calendar("a1"))

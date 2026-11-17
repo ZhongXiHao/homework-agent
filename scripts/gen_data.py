@@ -44,5 +44,9 @@ DATA_FILE.write_text(
     encoding="utf-8",
 )
 
+# 日历是写入工具的副作用，每次评测前清空，保证结果不受上一次运行影响
+CALENDAR_FILE = DATA_FILE.parent / "calendar.json"
+CALENDAR_FILE.write_text("[]", encoding="utf-8")
+
 if __name__ == "__main__":
     print(f"已生成 {DATA_FILE}")
