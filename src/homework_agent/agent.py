@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import os
+import sys
 import uuid
 
 from dotenv import load_dotenv
@@ -7,14 +9,18 @@ from homework_agent.checkpointer import init_checkpointer, close_checkpointer
 from homework_agent.prompts import SYSTEM_PROMPT
 from homework_agent.run_result import RunResult
 from langchain.agents import create_agent
+from langchain_core.exceptions import ModelAuthenticationError, ModelTimeoutError, ModelRateLimitError, ModelError
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from langgraph.errors import GraphRecursionError
-import sys
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+RUN_TIMEOUT = 180
 
 mcp_client = MultiServerMCPClient(
     {"homework": {"command": "uv", "args": ["run", "python", "-m", "homework_agent.mcp_server"], "transport": "stdio"}})
@@ -24,6 +30,8 @@ llm = ChatOpenAI(
     api_key=os.getenv("LLM_API_KEY"),
     base_url=os.getenv("LLM_BASE_URL"),
     reasoning_effort="low",
+    timeout=60,
+    max_retries=2
 )
 
 _runner = asyncio.Runner()
@@ -43,39 +51,55 @@ async def _arun(question, max_steps, verbose, my_checkpointer, thread_id) -> Run
     if thread_id:
         config["configurable"] = {"thread_id": thread_id}
     try:
-        async for chunk in agent.astream(
-                {"messages": [HumanMessage(question)]},
-                config=config,
-                stream_mode="updates"):
-            for node, update in chunk.items():
-                if not update:
-                    continue
-                if verbose:
-                    print(f"── {node} ──")
-                for msg in update["messages"]:
+        async with asyncio.timeout(RUN_TIMEOUT):  # 给整轮对话设一个总时限
+            async for chunk in agent.astream(
+                    {"messages": [HumanMessage(question)]},
+                    config=config,
+                    stream_mode="updates"):
+                for node, update in chunk.items():
+                    if not update:
+                        continue
                     if verbose:
-                        msg.pretty_print()
-                    if isinstance(msg, AIMessage):
-                        output.steps += 1
-                        output.tool_calls += [c["name"] for c in msg.tool_calls]
-                        output.answer = msg.content
-                        if msg.usage_metadata:
-                            output.tokens += msg.usage_metadata["total_tokens"]
+                        print(f"── {node} ──")
+                    for msg in update["messages"]:
+                        if verbose:
+                            msg.pretty_print()
+                        if isinstance(msg, AIMessage):
+                            output.steps += 1
+                            output.tool_calls += [c["name"] for c in msg.tool_calls]
+                            output.answer = msg.content
+                            if msg.usage_metadata:
+                                output.tokens += msg.usage_metadata["total_tokens"]
     except GraphRecursionError:
         output.answer = "超过最大步数，未能完成"
+    except ModelAuthenticationError:
+        raise  # 配置错误，不吞
+    except ModelTimeoutError:
+        logger.warning("模型请求超时（已重试 %d 次）", llm.max_retries)
+        output.answer = "模型响应超时，请稍后再试"
+    except TimeoutError:
+        logger.warning("整轮对话超过 %d 秒", RUN_TIMEOUT)
+        output.answer = "处理时间过长，请稍后再试"
+    except ModelRateLimitError:
+        output.answer = "请求太频繁，请稍后再试"
+    except ModelError:
+        logger.exception("模型调用失败")
+        output.answer = "模型服务出错，请稍后再试"
     return output
+
 
 async def chat(thread_id: str | None):
     ck = await init_checkpointer()
     try:
         thread_id = thread_id or str(uuid.uuid4())
-        print(f"thread_id = {thread_id}")   # 记下来，下次用
-        while (q := input("你：").strip()) not in ("", "exit"):
+        print(f"thread_id = {thread_id}")  # 记下来，下次用
+        while (q := await asyncio.to_thread(input, "你：").strip()) not in ("", "exit"):
             r = await _arun(q, max_steps=8, verbose=False, my_checkpointer=ck,
                             thread_id=thread_id)
             print("助手：", r.answer)
     finally:
         await close_checkpointer()
+
 
 if __name__ == "__main__":
     _runner.run(chat(sys.argv[1] if len(sys.argv) > 1 else None))
