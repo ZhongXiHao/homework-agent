@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import json
 import subprocess
 import sys
 import time
@@ -9,7 +10,9 @@ from pathlib import Path
 from langgraph.checkpoint.memory import InMemorySaver
 
 impl = sys.argv[1] if len(sys.argv) > 1 else "graph"
-run = importlib.import_module(f"homework_agent.{impl}").run
+module = importlib.import_module(f"homework_agent.{impl}")
+run = module.run
+resume = getattr(module, "resume", None)  # 支持人工确认（interrupt）的实现才有 resume
 
 print(f"Using implementation: {impl}")
 
@@ -22,6 +25,11 @@ memory = InMemorySaver() if SUPPORTS_MEMORY else None
 # 每次评测前重新生成模拟数据，保证截止时间相对于“今天”是固定的
 GEN_DATA = Path(__file__).resolve().parent / "gen_data.py"
 subprocess.run([sys.executable, str(GEN_DATA)], check=True)
+CALENDAR_FILE = GEN_DATA.parent.parent / "data" / "calendar.json"
+
+
+def calendar_ids() -> set[str]:
+    return {e["assignment_id"] for e in json.loads(CALENDAR_FILE.read_text(encoding="utf-8"))}
 
 # 每个用例：
 #   question        单轮问题；多轮用 turns: [问题1, 问题2, ...]，同一个 thread_id 依次提问，只检查最后一轮
@@ -29,6 +37,8 @@ subprocess.run([sys.executable, str(GEN_DATA)], check=True)
 #   answer_contains 答案里必须全部出现的关键词（不区分大小写）
 #   answer_any      至少出现其中一个（用于措辞不固定的情况，如"没有/暂无"）
 #   answer_not      一个都不能出现（用于检查模型有没有声称做了做不到的事）
+#   approve         遇到人工确认时批准(True)还是拒绝(False)；不写默认拒绝（意料之外的写入一律不放行）
+#   expect_calendar 跑完后 calendar.json 里应有的作业 ID 集合（检查写入工具的副作用，比检查措辞可靠）
 CASES = [
     # ---- 基础查询 ----
     {"question": "这周最紧的是哪门课？",
@@ -62,10 +72,22 @@ CASES = [
     {"question": "数据结构有作业吗？",
      "expect_tools": {"list_assignments"},
      "answer_any": ["没有", "暂无", "未找到", "没找到", "不存在"]},
-    {"question": "帮我把需求规格说明书的截止时间加到日历里",  # 目前没有写入工具
-     "expect_tools": None,
-     "answer_any": ["无法", "不能", "不支持", "暂不"],
-     "answer_not": ["已添加", "已经添加", "添加成功", "已为你添加", "已帮你添加"]},
+    {"question": "帮我把需求规格说明书的截止时间加到日历里",
+     "expect_tools": {"add_to_calendar"},
+     "answer_any": ["添加", "加入", "加到"],
+     "answer_not": ["无法", "失败"],
+     "approve": True,
+     "expect_calendar": {"a1"}},
+    {"question": "帮我把 lab1 加到日历里",  # 用户拒绝：不能写入，也不能声称写入了
+     "expect_tools": {"add_to_calendar"},
+     "approve": False,
+     "answer_not": ["已加入", "已添加", "添加成功"],
+     "expect_calendar": set()},
+    {"question": "把计算机网络的作业加到日历里",  # a3 没有截止时间，工具会报错
+     "expect_tools": None,  # 模型可能先查列表发现没有截止时间就不调了，也可能调了收到报错，都可以
+     "answer_any": ["没有截止", "无截止", "没有设置", "未设置", "无法"],
+     "answer_not": ["已加入", "已添加", "添加成功"],
+     "expect_calendar": set()},
     # ---- 多轮追问：检查记忆 ----
     {"turns": ["计算机网络的作业什么时候截止？", "那它的要求是什么？"],
      "expect_tools": {"get_assignment"},  # 要从上一轮知道"它"是 a3，再去查详情
@@ -96,14 +118,27 @@ for case in CASES:
         test_results.append({"question": label, "skipped": True})
         continue
 
+    CALENDAR_FILE.write_text("[]", encoding="utf-8")  # 每题前清空日历，用例之间互不影响
     # 每个用例一个新的 thread_id，用例之间互不污染
     kwargs = {"thread_id": str(uuid.uuid4()), "my_checkpointer": memory} if SUPPORTS_MEMORY else {}
     start = time.perf_counter()
     tokens = steps = 0
+    interrupts = 0
     for q in turns:
         r = run(q, verbose=False, **kwargs)
         tokens += r.tokens
         steps += r.steps
+        turn_tools = list(r.tool_calls)
+        # 停在人工确认：按用例的 approve 自动作答，然后恢复，直到没有中断
+        while r.interrupt and resume:
+            interrupts += 1
+            decision = ({"type": "approve"} if case.get("approve", False)
+                        else {"type": "reject", "message": "用户拒绝了这次操作，没有执行"})
+            r = resume([decision] * len(r.interrupt["action_requests"]), verbose=False, **kwargs)
+            tokens += r.tokens
+            steps += r.steps
+            turn_tools += r.tool_calls  # 中断前后的工具调用合并算作这一轮
+        r.tool_calls = turn_tools
     elapsed = time.perf_counter() - start
     called = set(r.tool_calls)  # 只看最后一轮调用了哪些工具
     expect_tools = case["expect_tools"]
@@ -119,6 +154,8 @@ for case in CASES:
     if any_kw and not any(kw.lower() in answer for kw in any_kw):
         missing_kw.append("任一: " + "/".join(any_kw))
     missing_kw += ["不该出现: " + kw for kw in case.get("answer_not", []) if kw.lower() in answer]
+    if "expect_calendar" in case and (got := calendar_ids()) != case["expect_calendar"]:
+        missing_kw.append(f"日历应为 {sorted(case['expect_calendar'])}，实际 {sorted(got)}")
     answer_ok = not missing_kw
     passed = tools_ok and answer_ok
     if passed:
@@ -129,6 +166,7 @@ for case in CASES:
         "tool_calls": r.tool_calls,
         "tokens": tokens,
         "steps": steps,
+        "interrupts": interrupts,
         "elapsed": elapsed,
         "answer": r.answer,
         "tool_not_calls": (expect_tools or set()) - called,
@@ -144,6 +182,7 @@ for test_result in test_results:
     print(f"{'✅' if test_result['passed'] else '❌'} {test_result['question']}  "
           f"tools={test_result['tool_calls']}  "
           f"{test_result['tokens']} tok  {test_result['steps']} 步  {test_result['elapsed']:.1f}s"
+          f"{'  确认 ' + str(test_result['interrupts']) + ' 次' if test_result['interrupts'] else ''}"
           f"{'  缺少: ' + ', '.join(test_result['tool_not_calls']) if test_result['tool_not_calls'] else ''}"
           f"{'  不该调用: ' + ', '.join(test_result['unexpected_tools']) if test_result['unexpected_tools'] else ''}"
           f"{'  缺少关键词: ' + ', '.join(test_result['missing_kw']) if test_result['missing_kw'] else ''}"
