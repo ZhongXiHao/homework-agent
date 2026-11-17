@@ -12,8 +12,10 @@ dependencies = [
     "langchain-mcp-adapters>=0.3.2",
     "langchain-openai>=1.7.4",
     "langgraph>=1.2.20",
+    "langgraph-checkpoint-postgres>=3.2.1",
     "mcp[cli]>=1.30.0",
     "openai>=3.46.0",
+    "psycopg[binary,pool]>=3.3.9",
     "python-dotenv>=1.2.4",
 ]
 
