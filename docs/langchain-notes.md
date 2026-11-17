@@ -430,3 +430,126 @@ m = Fake(messages=iter([AIMessage("", tool_calls=[bad_call]), AIMessage("done")]
 ```
 
 假模型按顺序返回预设的消息，可以精确构造"模型调错了工具"这类场景。测试跑得快，结果确定，也不花 token。
+
+## 11. 异步：MCP 版踩到的坑
+
+> 基于 `mcp 1.30.0`、`langchain-mcp-adapters 0.3.2`。
+
+### 顶层 `await`：`SyntaxError: 'await' outside function`
+
+Python 脚本里，`await` 只能写在 `async def` 函数内部。网上教程大多在 Jupyter 里运行，Jupyter 自带一个正在运行的事件循环，所以单元格里可以直接写顶层 `await`。复制到 `.py` 文件里就会报这个语法错误。类比 JS：ES module 允许顶层 `await`，CommonJS 不允许。Python 脚本相当于后者。
+
+```python
+async def main():
+    mcp_tools = await mcp_client.get_tools()
+    ...
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### MCP 工具只能异步调用
+
+```
+func: None | coroutine: True
+tool.invoke({}) -> NotImplementedError: StructuredTool does not support sync invocation.
+```
+
+适配器生成的 `StructuredTool` 只有协程实现，因为每次调用都要通过 stdio 和 server 进程通信。所以 agent 必须用 `ainvoke` / `astream`。为了让 `eval.py` 继续调用同步的 `run()`，在 `run()` 内部把异步流程包一层：
+
+```python
+def run(question, max_steps=8, verbose=True) -> RunResult:
+    return _runner.run(_arun(question, max_steps, verbose))
+
+async def _arun(...):
+    ...
+    async for chunk in agent.astream(..., stream_mode="updates"):   # for 的异步版
+        ...
+```
+
+### 坑：第二次 `asyncio.run` 报 `RuntimeError: Event loop is closed`
+
+现象：eval 第一题通过，第二题崩溃。
+
+```
+1 OK 471
+2 ERR RuntimeError: Event loop is closed
+```
+
+原因有两条叠加：
+
+1. **`asyncio.run()` 每次调用都会新建一个事件循环，函数返回后把它关掉。**
+2. **`ChatOpenAI` 默认的异步 HTTP 客户端是全局缓存的**（`langchain_openai/chat_models/_client_utils.py`）：
+
+   ```python
+   @lru_cache
+   def _cached_async_httpx_client(base_url, timeout, socket_options=()):
+       return _build_async_httpx_client(base_url, timeout, socket_options)
+   ```
+
+   缓存 key 是 `(base_url, timeout)`，所以**所有 base_url 相同的 `ChatOpenAI` 实例共用同一个 `AsyncClient` 和它的连接池**。
+
+第一题在循环 1 里建立的连接被留在了连接池里。第二题在循环 2 里，客户端去处理这条还绑在已关闭的循环 1 上的旧连接，于是报错。Java 类比：全局单例的连接池，里面的连接绑在一个已经 shutdown 的 `ExecutorService` 上。
+
+**每次 run 都新建一个 `ChatOpenAI` 也没用**，实测同样会报错，因为缓存是模块级的，和实例无关。
+
+**同步版本（graph、create_agent）为什么没有这个问题：** 它们走的是 `_cached_sync_httpx_client`，同样是全局缓存，但同步客户端不依赖事件循环，复用多少次都没问题。只有"全局缓存的**异步**客户端"加上"**每次新建、用完就关**的事件循环"，两个条件同时满足才会出错。
+
+**修法：用 `asyncio.Runner` 让所有 run 共用一个事件循环**（Python 3.11+）：
+
+```python
+_runner = asyncio.Runner()
+
+def run(question, max_steps=8, verbose=True) -> RunResult:
+    return _runner.run(_arun(question, max_steps, verbose))
+```
+
+实测连续两次都正常（`1 OK 500`、`2 OK 513`），eval 结果 3/3。
+
+另一种修法：每次 run 传入自己的 `ChatOpenAI(..., http_async_client=httpx.AsyncClient())`，绕过全局缓存，用完再 `aclose()`。这样要多管理一个资源的生命周期，所以没有采用。
+
+**通用教训：** 库内部的缓存和单例，会让"每次新建对象"失去隔离效果。遇到异步相关的报错时，先确认涉及几个事件循环，再查哪些对象跨循环共享了。
+
+#### 同步：线程自己等，中间没有别人
+
+同步连接本质上就是操作系统给的一个 socket。读数据时，当前线程直接调用操作系统的 `recv()`，操作系统让线程停住，数据到了再唤醒它。
+
+整个过程只有**线程 → 操作系统**两方。连接对象里只记着"我是哪个 socket"，不依赖任何第三方。所以只要 socket 没断，过多久、被谁调用都能接着用。全局缓存它没有任何问题。
+
+#### 异步：委托事件循环来等，而且记住的是"创建时的那个循环"
+
+异步代码不能让线程停住，所以等数据这件事要**委托给事件循环**：
+
+> "循环①，这个 socket 来数据时请通知我。"
+
+关键在于：异步连接对象（transport、stream 这些）**创建时就把当时的循环记在自己身上**（内部有个 `_loop` 属性）。以后每次读、写、关闭，它找的都是这个记下来的循环，而不是"当前正在运行的那个循环"。
+
+于是关系变成了**线程 → 循环① → 操作系统**三方。`asyncio.run` 结束时，循环①被关闭，这个中间人没了，连接却还认它。
+
+打个比方：
+
+- 同步就像你自己站在取餐柜台前等，什么时候来都能取。
+- 异步就像你把电话留给前台小王，让他餐好了打给你，取餐单上写着"联系人：小王"。第二天小王已经离职，你拿着这张单子去找新来的小李，单子上写的还是小王，所以没法用。
+
+### MCP 工具的 docstring 不会被解析
+
+`mcp` 自带的 `FastMCP` 会把**整段 docstring 原样**作为工具描述，包括缩进和换行。`Args:` 段不会被拆到参数的 description 里。参数描述要用 `Field` 写：
+
+```python
+@mcp.tool()
+def list_assignments(
+    course: Annotated[str | None, Field(description="课程名，可省略")] = None,
+) -> list[dict]:
+    """列出未提交作业的摘要……"""
+```
+
+| | LangChain `@tool(parse_docstring=True)` | MCP `@mcp.tool()` |
+| --- | --- | --- |
+| `Args:` 段 | 拆成各参数的 description | 原样留在工具描述里，参数没有 description |
+| 参数描述写法 | `Args:` 或 `Annotated` | `Annotated[..., Field(description=...)]` |
+
+MCP 生成的 schema 还会多出 `title` 字段（如 `"title": "Course"`），和 `@tool` 生成的不完全一样。对比 eval 的 token 时要考虑这部分差异。
+
+### 结果
+
+MCP 版 eval 3/3：1943 / 1933 / 498 tok，和其他三个版本在同一水平。每道题都会重新执行 `get_tools()`，也就会重新启动一次 MCP server 子进程，所以每题会多花一两秒。
